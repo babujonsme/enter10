@@ -14,9 +14,18 @@ dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Initialize Turso Client
+const url = process.env.TURSO_DATABASE_URL;
+const authToken = process.env.TURSO_AUTH_TOKEN;
+
+console.log('Database Configuration:', {
+  url: url ? 'Set (Hidden)' : 'Not Set',
+  authToken: authToken ? 'Set (Hidden)' : 'Not Set',
+  nodeEnv: process.env.NODE_ENV
+});
+
 const db = createClient({
-  url: process.env.TURSO_DATABASE_URL || 'file:local.db',
-  authToken: process.env.TURSO_AUTH_TOKEN,
+  url: url || 'file::memory:',
+  authToken: authToken,
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-123';
