@@ -9,12 +9,17 @@ export async function fetcher(url: string, options: RequestInit = {}) {
   if (!res.ok) {
     let errorMessage = 'An error occurred';
     try {
-      const errorData = await res.json();
-      errorMessage = errorData.error || res.statusText;
+      // Read text first to avoid "body stream already read" if json() fails
+      const text = await res.text();
+      try {
+        const errorData = JSON.parse(text);
+        errorMessage = errorData.error || res.statusText;
+      } catch {
+        // If not JSON, use the text directly
+        errorMessage = text || res.statusText;
+      }
     } catch (e) {
-      // If json parsing fails, try to get text
-      const textError = await res.text();
-      errorMessage = textError || res.statusText;
+      errorMessage = res.statusText;
     }
     throw new Error(errorMessage);
   }
