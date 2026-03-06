@@ -1,0 +1,8 @@
+{
+  "name": "Babu Enter10 Dashboard",
+  "description": "A dynamic dashboard for Babu Enter10 production house to manage scripts, expenses, videos, and team communication.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
