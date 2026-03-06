@@ -22,31 +22,29 @@ console.log('Database Configuration:', {
   nodeEnv: process.env.NODE_ENV
 });
 
-// Create DB client only if URL is provided, otherwise null
-// This prevents crashing if credentials are missing
-const db = url ? createClient({
-  url: url,
+// Use Turso if available, otherwise fallback to local file (which requires a driver)
+// If running locally without Turso credentials, this might fail if better-sqlite3 is missing.
+// However, for Vercel, we MUST rely on Turso.
+const dbUrl = url || 'file:local.db';
+const db = createClient({
+  url: dbUrl,
   authToken: authToken,
-}) : null;
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-123';
 
 // Helper to execute SQL safely
 async function safeExecute(sql: string, args: any[] = []) {
-  if (!db) {
-    console.error('Database not configured. Skipping query:', sql);
-    throw new Error('Database not configured');
+  try {
+    return await db.execute({ sql, args });
+  } catch (e) {
+    console.error(`Database Error (URL: ${dbUrl}):`, e);
+    throw e;
   }
-  return await db.execute({ sql, args });
 }
 
 // Initialize Database Schema (Async)
 async function initializeDatabase() {
-  if (!db) {
-    console.log('Skipping database initialization: No credentials');
-    return;
-  }
-
   try {
     await safeExecute(`
       CREATE TABLE IF NOT EXISTS users (
