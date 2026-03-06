@@ -9,7 +9,22 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database('babu_enter10.db');
+
+// Determine database path based on environment
+// Vercel/Serverless environments have read-only file systems except for /tmp
+const dbPath = process.env.NODE_ENV === 'production' 
+  ? '/tmp/babu_enter10.db' 
+  : 'babu_enter10.db';
+
+let db;
+try {
+  db = new Database(dbPath);
+} catch (err) {
+  console.error('Failed to initialize database at', dbPath, err);
+  // Fallback to memory if file creation fails
+  db = new Database(':memory:');
+}
+
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-123';
 
 // Initialize Database
