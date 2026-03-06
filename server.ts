@@ -91,6 +91,7 @@ try {
 } catch (e) {
   // Column likely exists
 }
+/*
 try {
   db.prepare("ALTER TABLE script_comments ADD COLUMN status TEXT DEFAULT 'pending'").run();
 } catch (e) {
@@ -102,6 +103,7 @@ try {
 } catch (e) {
   // Column likely exists
 }
+*/
 
 async function startServer() {
   const app = express();
