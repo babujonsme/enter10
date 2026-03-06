@@ -1,6 +1,5 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { WebSocketServer, WebSocket } from 'ws';
 import { createClient } from '@libsql/client';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -23,17 +22,33 @@ console.log('Database Configuration:', {
   nodeEnv: process.env.NODE_ENV
 });
 
-const db = createClient({
-  url: url || 'file::memory:',
+// Create DB client only if URL is provided, otherwise null
+// This prevents crashing if credentials are missing
+const db = url ? createClient({
+  url: url,
   authToken: authToken,
-});
+}) : null;
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-123';
 
+// Helper to execute SQL safely
+async function safeExecute(sql: string, args: any[] = []) {
+  if (!db) {
+    console.error('Database not configured. Skipping query:', sql);
+    throw new Error('Database not configured');
+  }
+  return await db.execute({ sql, args });
+}
+
 // Initialize Database Schema (Async)
 async function initializeDatabase() {
+  if (!db) {
+    console.log('Skipping database initialization: No credentials');
+    return;
+  }
+
   try {
-    await db.execute(`
+    await safeExecute(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
@@ -43,7 +58,7 @@ async function initializeDatabase() {
       );
     `);
     
-    await db.execute(`
+    await safeExecute(`
       CREATE TABLE IF NOT EXISTS scripts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
@@ -55,7 +70,7 @@ async function initializeDatabase() {
       );
     `);
 
-    await db.execute(`
+    await safeExecute(`
       CREATE TABLE IF NOT EXISTS script_comments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         script_id INTEGER,
@@ -70,7 +85,7 @@ async function initializeDatabase() {
       );
     `);
 
-    await db.execute(`
+    await safeExecute(`
       CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         description TEXT,
@@ -81,7 +96,7 @@ async function initializeDatabase() {
       );
     `);
 
-    await db.execute(`
+    await safeExecute(`
       CREATE TABLE IF NOT EXISTS videos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
@@ -92,7 +107,7 @@ async function initializeDatabase() {
       );
     `);
 
-    await db.execute(`
+    await safeExecute(`
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender_id INTEGER,
@@ -103,32 +118,34 @@ async function initializeDatabase() {
     `);
 
     // Seed initial user if empty
-    const userCountResult = await db.execute('SELECT count(*) as count FROM users');
-    const userCount = userCountResult.rows[0] as unknown as { count: number };
-    
-    if (userCount.count === 0) {
-      console.log('Seeding initial users...');
-      const hash = bcrypt.hashSync('password123', 10);
-      await db.execute({
-        sql: 'INSERT INTO users (username, password_hash, role, avatar_url) VALUES (?, ?, ?, ?)',
-        args: ['admin', hash, 'admin', 'https://api.dicebear.com/7.x/avataaars/svg?seed=admin']
-      });
-      await db.execute({
-        sql: 'INSERT INTO users (username, password_hash, role, avatar_url) VALUES (?, ?, ?, ?)',
-        args: ['babu', hash, 'member', 'https://api.dicebear.com/7.x/avataaars/svg?seed=babu']
-      });
-      console.log('Seeding completed.');
+    try {
+      const userCountResult = await safeExecute('SELECT count(*) as count FROM users');
+      const userCount = userCountResult.rows[0] as unknown as { count: number };
+      
+      if (userCount.count === 0) {
+        console.log('Seeding initial users...');
+        const hash = bcrypt.hashSync('password123', 10);
+        await safeExecute(
+          'INSERT INTO users (username, password_hash, role, avatar_url) VALUES (?, ?, ?, ?)',
+          ['admin', hash, 'admin', 'https://api.dicebear.com/7.x/avataaars/svg?seed=admin']
+        );
+        await safeExecute(
+          'INSERT INTO users (username, password_hash, role, avatar_url) VALUES (?, ?, ?, ?)',
+          ['babu', hash, 'member', 'https://api.dicebear.com/7.x/avataaars/svg?seed=babu']
+        );
+        console.log('Seeding completed.');
+      }
+    } catch (seedErr) {
+      console.error('Seeding error:', seedErr);
     }
 
-    // Migrations (Check if columns exist before adding)
-    // Note: Turso/SQLite doesn't support IF NOT EXISTS for ADD COLUMN directly in all versions, 
-    // but we can try/catch it safely.
+    // Migrations
     try {
-      await db.execute('ALTER TABLE script_comments ADD COLUMN selected_text TEXT');
+      await safeExecute('ALTER TABLE script_comments ADD COLUMN selected_text TEXT');
     } catch (e) { /* Column likely exists */ }
     
     try {
-      await db.execute('ALTER TABLE script_comments ADD COLUMN suggestion TEXT');
+      await safeExecute('ALTER TABLE script_comments ADD COLUMN suggestion TEXT');
     } catch (e) { /* Column likely exists */ }
 
     console.log('Database initialized successfully');
@@ -160,14 +177,19 @@ const authenticateToken = (req: any, res: any, next: any) => {
 
 // API Routes
 
+// Health Check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    database: db ? 'configured' : 'missing_credentials' 
+  });
+});
+
 // Auth
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const result = await db.execute({
-      sql: 'SELECT * FROM users WHERE username = ?',
-      args: [username]
-    });
+    const result = await safeExecute('SELECT * FROM users WHERE username = ?', [username]);
     const user = result.rows[0] as any;
     
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
@@ -178,6 +200,7 @@ app.post('/api/auth/login', async (req, res) => {
     res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'none' }); 
     res.json({ user: { id: user.id, username: user.username, role: user.role, avatar_url: user.avatar_url } });
   } catch (err) {
+    console.error('Login error:', err);
     res.status(500).json({ error: 'Login failed' });
   }
 });
@@ -189,10 +212,7 @@ app.post('/api/auth/logout', (req, res) => {
 
 app.get('/api/auth/me', authenticateToken, async (req: any, res) => {
   try {
-    const result = await db.execute({
-      sql: 'SELECT id, username, role, avatar_url FROM users WHERE id = ?',
-      args: [req.user.id]
-    });
+    const result = await safeExecute('SELECT id, username, role, avatar_url FROM users WHERE id = ?', [req.user.id]);
     const user = result.rows[0];
     res.json({ user });
   } catch (err) {
@@ -206,12 +226,11 @@ app.post('/api/auth/register', async (req, res) => {
     const hash = bcrypt.hashSync(password, 10);
     const avatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`;
     
-    const result = await db.execute({
-      sql: 'INSERT INTO users (username, password_hash, avatar_url) VALUES (?, ?, ?)',
-      args: [username, hash, avatar]
-    });
+    const result = await safeExecute(
+      'INSERT INTO users (username, password_hash, avatar_url) VALUES (?, ?, ?)',
+      [username, hash, avatar]
+    );
     
-    // lastInsertRowid is a bigint, convert to number or string
     const userId = Number(result.lastInsertRowid);
     const user = { id: userId, username, role: 'member', avatar_url: avatar };
     
@@ -226,7 +245,7 @@ app.post('/api/auth/register', async (req, res) => {
 // Users
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute('SELECT id, username, role, avatar_url FROM users');
+    const result = await safeExecute('SELECT id, username, role, avatar_url FROM users');
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch users' });
@@ -239,10 +258,10 @@ app.post('/api/users', authenticateToken, async (req: any, res) => {
     const hash = bcrypt.hashSync(password, 10);
     const avatar = avatar_url || `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`;
     
-    const result = await db.execute({
-      sql: 'INSERT INTO users (username, password_hash, role, avatar_url) VALUES (?, ?, ?, ?)',
-      args: [username, hash, role || 'member', avatar]
-    });
+    const result = await safeExecute(
+      'INSERT INTO users (username, password_hash, role, avatar_url) VALUES (?, ?, ?, ?)',
+      [username, hash, role || 'member', avatar]
+    );
     
     const userId = Number(result.lastInsertRowid);
     res.json({ id: userId, username, role: role || 'member', avatar_url: avatar });
@@ -268,15 +287,9 @@ app.put('/api/users/:id', authenticateToken, async (req: any, res) => {
     query += ' WHERE id = ?';
     params.push(id);
     
-    await db.execute({
-      sql: query,
-      args: params
-    });
+    await safeExecute(query, params);
     
-    const result = await db.execute({
-      sql: 'SELECT id, username, role, avatar_url FROM users WHERE id = ?',
-      args: [id]
-    });
+    const result = await safeExecute('SELECT id, username, role, avatar_url FROM users WHERE id = ?', [id]);
     
     res.json(result.rows[0]);
   } catch (err) {
@@ -291,10 +304,7 @@ app.delete('/api/users/:id', authenticateToken, async (req: any, res) => {
     if (parseInt(req.params.id) === req.user.id) {
       return res.status(400).json({ error: 'Cannot delete your own account' });
     }
-    await db.execute({
-      sql: 'DELETE FROM users WHERE id = ?',
-      args: [req.params.id]
-    });
+    await safeExecute('DELETE FROM users WHERE id = ?', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete user' });
@@ -304,7 +314,7 @@ app.delete('/api/users/:id', authenticateToken, async (req: any, res) => {
 // Scripts
 app.get('/api/scripts', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`
+    const result = await safeExecute(`
       SELECT scripts.*, users.username as author_name, users.avatar_url as author_avatar 
       FROM scripts 
       JOIN users ON scripts.author_id = users.id 
@@ -320,10 +330,10 @@ app.post('/api/scripts', authenticateToken, async (req: any, res) => {
   const { title, content } = req.body;
   const created_at = new Date().toISOString();
   try {
-    const result = await db.execute({
-      sql: 'INSERT INTO scripts (title, content, author_id, created_at) VALUES (?, ?, ?, ?)',
-      args: [title, content, req.user.id, created_at]
-    });
+    const result = await safeExecute(
+      'INSERT INTO scripts (title, content, author_id, created_at) VALUES (?, ?, ?, ?)',
+      [title, content, req.user.id, created_at]
+    );
     const scriptId = Number(result.lastInsertRowid);
     res.json({ id: scriptId, title, content, author_id: req.user.id, created_at });
   } catch (err) {
@@ -333,29 +343,27 @@ app.post('/api/scripts', authenticateToken, async (req: any, res) => {
 
 app.get('/api/scripts/:id', authenticateToken, async (req, res) => {
   try {
-    const scriptResult = await db.execute({
-      sql: `
+    const scriptResult = await safeExecute(`
         SELECT scripts.*, users.username as author_name, users.avatar_url as author_avatar 
         FROM scripts 
         JOIN users ON scripts.author_id = users.id 
         WHERE scripts.id = ?
       `,
-      args: [req.params.id]
-    });
+      [req.params.id]
+    );
     
     const script = scriptResult.rows[0];
     if (!script) return res.status(404).json({ error: 'Script not found' });
 
-    const commentsResult = await db.execute({
-      sql: `
+    const commentsResult = await safeExecute(`
         SELECT script_comments.*, users.username as author_name, users.avatar_url as author_avatar 
         FROM script_comments 
         JOIN users ON script_comments.user_id = users.id 
         WHERE script_id = ? 
         ORDER BY created_at ASC
       `,
-      args: [req.params.id]
-    });
+      [req.params.id]
+    );
 
     res.json({ ...script, comments: commentsResult.rows });
   } catch (err) {
@@ -367,22 +375,21 @@ app.post('/api/scripts/:id/comments', authenticateToken, async (req: any, res) =
   const { content, selected_text, suggestion } = req.body;
   const created_at = new Date().toISOString();
   try {
-    const result = await db.execute({
-      sql: 'INSERT INTO script_comments (script_id, user_id, content, selected_text, suggestion, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      args: [req.params.id, req.user.id, content, selected_text, suggestion, created_at]
-    });
+    const result = await safeExecute(
+      'INSERT INTO script_comments (script_id, user_id, content, selected_text, suggestion, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [req.params.id, req.user.id, content, selected_text, suggestion, created_at]
+    );
     
     const commentId = Number(result.lastInsertRowid);
     
-    const commentResult = await db.execute({
-      sql: `
+    const commentResult = await safeExecute(`
         SELECT script_comments.*, users.username as author_name, users.avatar_url as author_avatar 
         FROM script_comments 
         JOIN users ON script_comments.user_id = users.id 
         WHERE script_comments.id = ?
       `,
-      args: [commentId]
-    });
+      [commentId]
+    );
 
     res.json(commentResult.rows[0]);
   } catch (err) {
@@ -392,10 +399,10 @@ app.post('/api/scripts/:id/comments', authenticateToken, async (req: any, res) =
 
 app.post('/api/scripts/:id/publish', authenticateToken, async (req: any, res) => {
   try {
-    await db.execute({
-      sql: "UPDATE scripts SET status = 'published' WHERE id = ?",
-      args: [req.params.id]
-    });
+    await safeExecute(
+      "UPDATE scripts SET status = 'published' WHERE id = ?",
+      [req.params.id]
+    );
     res.json({ success: true, status: 'published' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to publish script' });
@@ -406,20 +413,14 @@ app.post('/api/scripts/:id/approve-suggestion/:commentId', authenticateToken, as
   const { commentId } = req.params;
   
   try {
-    const commentResult = await db.execute({
-      sql: 'SELECT * FROM script_comments WHERE id = ?',
-      args: [commentId]
-    });
+    const commentResult = await safeExecute('SELECT * FROM script_comments WHERE id = ?', [commentId]);
     const comment = commentResult.rows[0] as any;
     
     if (!comment || !comment.selected_text || !comment.suggestion) {
       return res.status(400).json({ error: 'Invalid suggestion' });
     }
 
-    const scriptResult = await db.execute({
-      sql: 'SELECT * FROM scripts WHERE id = ?',
-      args: [req.params.id]
-    });
+    const scriptResult = await safeExecute('SELECT * FROM scripts WHERE id = ?', [req.params.id]);
     const script = scriptResult.rows[0] as any;
     
     if (!script.content.includes(comment.selected_text)) {
@@ -428,15 +429,8 @@ app.post('/api/scripts/:id/approve-suggestion/:commentId', authenticateToken, as
 
     const newContent = script.content.replace(comment.selected_text, comment.suggestion);
     
-    await db.execute({
-      sql: 'UPDATE scripts SET content = ? WHERE id = ?',
-      args: [newContent, req.params.id]
-    });
-    
-    await db.execute({
-      sql: "UPDATE script_comments SET status = 'approved' WHERE id = ?",
-      args: [commentId]
-    });
+    await safeExecute('UPDATE scripts SET content = ? WHERE id = ?', [newContent, req.params.id]);
+    await safeExecute("UPDATE script_comments SET status = 'approved' WHERE id = ?", [commentId]);
 
     res.json({ success: true, newContent });
   } catch (err) {
@@ -447,7 +441,7 @@ app.post('/api/scripts/:id/approve-suggestion/:commentId', authenticateToken, as
 // Expenses
 app.get('/api/expenses', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`
+    const result = await safeExecute(`
       SELECT expenses.*, users.username as added_by_name 
       FROM expenses 
       JOIN users ON expenses.added_by = users.id 
@@ -462,10 +456,10 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
 app.post('/api/expenses', authenticateToken, async (req: any, res) => {
   const { description, amount, date } = req.body;
   try {
-    const result = await db.execute({
-      sql: 'INSERT INTO expenses (description, amount, date, added_by) VALUES (?, ?, ?, ?)',
-      args: [description, amount, date, req.user.id]
-    });
+    const result = await safeExecute(
+      'INSERT INTO expenses (description, amount, date, added_by) VALUES (?, ?, ?, ?)',
+      [description, amount, date, req.user.id]
+    );
     const expenseId = Number(result.lastInsertRowid);
     res.json({ id: expenseId, description, amount, date, added_by: req.user.id });
   } catch (err) {
@@ -476,7 +470,7 @@ app.post('/api/expenses', authenticateToken, async (req: any, res) => {
 // Videos
 app.get('/api/videos', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`
+    const result = await safeExecute(`
       SELECT videos.*, users.username as uploader_name 
       FROM videos 
       JOIN users ON videos.uploaded_by = users.id 
@@ -492,10 +486,10 @@ app.post('/api/videos', authenticateToken, async (req: any, res) => {
   const { title, url } = req.body;
   const created_at = new Date().toISOString();
   try {
-    const result = await db.execute({
-      sql: 'INSERT INTO videos (title, url, uploaded_by, created_at) VALUES (?, ?, ?, ?)',
-      args: [title, url, req.user.id, created_at]
-    });
+    const result = await safeExecute(
+      'INSERT INTO videos (title, url, uploaded_by, created_at) VALUES (?, ?, ?, ?)',
+      [title, url, req.user.id, created_at]
+    );
     const videoId = Number(result.lastInsertRowid);
     res.json({ id: videoId, title, url, uploaded_by: req.user.id, created_at });
   } catch (err) {
@@ -506,7 +500,7 @@ app.post('/api/videos', authenticateToken, async (req: any, res) => {
 // Messages (Chat History)
 app.get('/api/messages', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`
+    const result = await safeExecute(`
       SELECT messages.*, users.username, users.avatar_url 
       FROM messages 
       JOIN users ON messages.sender_id = users.id 
@@ -547,56 +541,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 
     const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server running on http://localhost:${PORT}`);
-    });
-
-    // WebSocket Server for Chat
-    const wss = new WebSocketServer({ server });
-
-    wss.on('connection', (ws: any, req: any) => {
-      // Basic auth check via cookie parsing from headers (simplified)
-      // In a real app, we'd verify the token properly here
-      
-      ws.on('message', async (message: string) => {
-        try {
-          const data = JSON.parse(message);
-          if (data.type === 'chat') {
-            // Save to DB
-            const created_at = new Date().toISOString();
-            
-            // Note: WebSocket handlers are outside Express request flow, so we use db directly
-            // We need to handle this async operation carefully inside the sync callback
-            try {
-              const result = await db.execute({
-                sql: 'INSERT INTO messages (sender_id, content, created_at) VALUES (?, ?, ?)',
-                args: [data.userId, data.content, created_at]
-              });
-              
-              const messageId = Number(result.lastInsertRowid);
-              
-              // Broadcast to all clients
-              const broadcastData = JSON.stringify({
-                type: 'chat',
-                id: messageId,
-                sender_id: data.userId,
-                username: data.username,
-                avatar_url: data.avatar_url,
-                content: data.content,
-                created_at
-              });
-              
-              wss.clients.forEach((client) => {
-                if (client.readyState === WebSocket.OPEN) {
-                  client.send(broadcastData);
-                }
-              });
-            } catch (dbErr) {
-              console.error('Failed to save chat message:', dbErr);
-            }
-          }
-        } catch (e) {
-          console.error('WS Error', e);
-        }
-      });
     });
   }
   startServer();
